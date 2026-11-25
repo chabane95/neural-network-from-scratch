@@ -1,0 +1,2 @@
+seed,width,epochs,best_epoch,train_n,val_n,test_n,test_loss,test_accuracy,lr,batch_size,linear_test_loss,linear_test_accuracy
+42,32,200,172,750,210,300,0.066801254057492376,0.98333333333333328,0.0030000000000000001,32,0.89996456826792914,0.42333333333333334

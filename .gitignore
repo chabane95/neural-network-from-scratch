@@ -1,0 +1,6 @@
+/build*/
+/lauf*/
+/spiralnet
+/spiralnet.exe
+/.venv/
+__pycache__/
