@@ -1,5 +1,6 @@
 #include "experiment.h"
 #include "nn.h"
+#include "radial.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -22,11 +23,14 @@ static void usage(FILE *stream)
     fputs("Neural network from scratch | 3-Spiralen-Klassifikation\n"
           "  spiralnet train [--out lauf] [--seed 42] [--epochs 200]\n"
           "                  [--width 32] [--lr 0.003]\n"
+          "  spiralnet study [--out studie] [--seed 42] [--epochs 200] [--width 32] [--lr 0.003]\n"
           "  spiralnet predict MODELL X1 X2\n"
           "  spiralnet check\n"
           "\n"
           "train erzeugt einen neuen Ausgabeordner. Sein Elternordner muss existieren.\n"
-          "width setzt die Breite beider verdeckten Schichten (1 bis 256).\n"
+          "study vergleicht fuenf aufeinanderfolgende Seeds ab dem angegebenen Startwert.\n"
+          "width, epochs und lr konfigurieren das MLP; die Radialbasis besitzt acht Stuetzstellen.\n"
+          "width setzt die Breite beider verdeckten MLP-Schichten (1 bis 256).\n"
           "predict schreibt die vorhergesagte Klasse und drei Wahrscheinlichkeiten als CSV.\n",
           stream);
 }
@@ -54,7 +58,8 @@ static int train(int argc, char **argv)
     unsigned seed = 42;
     int epochs = 200, width = 32;
     double lr = 0.003;
-    const char *out = "lauf";
+    int study = strcmp(argv[1], "study") == 0;
+    const char *out = study ? "studie" : "lauf";
 
     for (int i = 2; i < argc; i += 2) {
         const char *option = argv[i];
@@ -83,6 +88,10 @@ static int train(int argc, char **argv)
         }
     }
 
+    if (study && seed > UINT32_MAX - 4) {
+        fputs("Fuenf aufeinanderfolgende 32-Bit-Seeds muessen darstellbar sein.\n", stderr);
+        return EXIT_FAILURE;
+    }
     if (new_directory(out) != 0) {
         if (errno == EEXIST)
             fprintf(stderr, "Ordner oder Datei existiert bereits. Bitte mit --out einen neuen Lauf benennen.\n");
@@ -90,7 +99,7 @@ static int train(int argc, char **argv)
             perror(out);
         return EXIT_FAILURE;
     }
-    if (!run_experiment(out, seed, epochs, width, lr)) {
+    if (!(study ? run_study(out, seed, epochs, width, lr) : run_experiment(out, seed, epochs, width, lr))) {
         fprintf(stderr, "Training fehlgeschlagen. Unvollstaendige Ausgabe in %s\n", out);
         return EXIT_FAILURE;
     }
@@ -105,12 +114,17 @@ static int predict(const char *path, const char *first, const char *second)
         fputs("X1 und X2 muessen endliche Zahlen sein. Dezimaltrennzeichen ist der Punkt.\n", stderr);
         return EXIT_FAILURE;
     }
-    if (!nn_load(&model, path)) {
+    Radial radial;
+    double status;
+    if (nn_load(&model, path)) {
+        status = nn_predict(&model, point, probabilities, -1);
+        nn_free(&model);
+    } else if (radial_load(&radial, path)) {
+        status = radial_predict(&radial, point, probabilities, -1);
+    } else {
         fprintf(stderr, "Modell konnte nicht geladen werden: %s\n", path);
         return EXIT_FAILURE;
     }
-    double status = nn_predict(&model, point, probabilities, -1);
-    nn_free(&model);
     if (!isfinite(status)) {
         fputs("Vorhersage fuer diese Eingabe numerisch nicht darstellbar.\n", stderr);
         return EXIT_FAILURE;
@@ -131,12 +145,12 @@ int main(int argc, char **argv)
         usage(stdout);
         return EXIT_SUCCESS;
     }
-    if (argc >= 2 && strcmp(argv[1], "train") == 0)
+    if (argc >= 2 && (strcmp(argv[1], "train") == 0 || strcmp(argv[1], "study") == 0))
         return train(argc, argv);
     if (argc == 5 && strcmp(argv[1], "predict") == 0)
         return predict(argv[2], argv[3], argv[4]);
     if (argc == 2 && strcmp(argv[1], "check") == 0)
-        return nn_selftest() ? EXIT_SUCCESS : EXIT_FAILURE;
+        return nn_selftest() && radial_check() ? EXIT_SUCCESS : EXIT_FAILURE;
     usage(stderr);
     return EXIT_FAILURE;
 }

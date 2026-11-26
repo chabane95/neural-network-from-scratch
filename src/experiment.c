@@ -1,5 +1,6 @@
 #include "experiment.h"
 #include "nn.h"
+#include "radial.h"
 
 #include <limits.h>
 #include <math.h>
@@ -19,11 +20,6 @@ enum {
 };
 
 static const double tau = 6.28318530717958647693;
-
-typedef struct {
-    double x[2];
-    int label;
-} Point;
 
 typedef struct {
     double loss;
@@ -210,7 +206,7 @@ static Metrics evaluate_linear(const LinearModel *model, const Point test[])
     return (Metrics){loss / TEST_N, (double)correct / TEST_N};
 }
 
-static int write_surface(FILE *fp, const NN *net, int frame, int epoch)
+static int write_surface(FILE *fp, const NN *net, const Radial *radial, int frame, int epoch)
 {
     const double extent = 1.15;
     for (int row = 0; row < GRID; ++row) {
@@ -218,7 +214,7 @@ static int write_surface(FILE *fp, const NN *net, int frame, int epoch)
         for (int col = 0; col < GRID; ++col) {
             double x[2] = {-extent + 2 * extent * col / (GRID - 1), x2};
             double p[CLASSES];
-            double status = nn_predict(net, x, p, -1);
+            double status = radial ? radial_predict(radial, x, p, -1) : nn_predict(net, x, p, -1);
             if (!isfinite(status) || !isfinite(p[0]) || !isfinite(p[1]) || !isfinite(p[2]))
                 return 0;
             fprintf(fp, "%d,%d,%.8g,%.8g,%.8g,%.8g,%.8g\n", frame, epoch,
@@ -266,23 +262,87 @@ static int is_snapshot_epoch(int epoch, int epochs)
     return 0;
 }
 
-static int write_summary(const char *dir, unsigned seed, int width, int epochs, int best_epoch,
-                         double lr, Metrics test, Metrics linear)
+static Metrics evaluate_radial(const Radial *m, const Point *points, int n, FILE *predictions)
 {
-    FILE *fp = open_output(dir, "summary.csv");
-    if (!fp)
-        return 0;
-    fputs("seed,width,epochs,best_epoch,train_n,val_n,test_n,test_loss,test_accuracy,"
-          "lr,batch_size,linear_test_loss,linear_test_accuracy\n", fp);
-    fprintf(fp, "%u,%d,%d,%d,%d,%d,%d,%.17g,%.17g,%.17g,%d,%.17g,%.17g\n",
-            seed, width, epochs, best_epoch, TRAIN_N, VAL_N, TEST_N, test.loss, test.accuracy,
-            lr, BATCH, linear.loss, linear.accuracy);
-    return close_output(fp);
+    Metrics metrics = {0};
+    for (int i = 0; i < n; ++i) {
+        double p[3];
+        const Point *point = points + i;
+        metrics.loss += radial_predict(m, point->x, p, point->label);
+        int pred = 0;
+        for (int k = 1; k < 3; ++k)
+            if (p[k] > p[pred])
+                pred = k;
+        metrics.accuracy += pred == point->label;
+        if (predictions)
+            fprintf(predictions, "%.17g,%.17g,%d,%d,%.17g,%.17g,%.17g\n",
+                    point->x[0], point->x[1], point->label, pred, p[0], p[1], p[2]);
+    }
+    return (Metrics){metrics.loss / n, metrics.accuracy / n};
 }
 
-int run_experiment(const char *out, unsigned seed, int epochs, int width, double lr)
+static int run_radial(const char *out, const Point *train, const Point *val, const Point *test,
+                      int *best_step, Metrics *test_result)
 {
-    if (!out || !*out || epochs < 1 || epochs == INT_MAX || width < 1 ||
+    Radial current, selected;
+    radial_init(&current, train, TRAIN_N);
+    double minimum = HUGE_VAL;
+    FILE *history = NULL, *surface = NULL, *pred = NULL, *checkpoint = NULL;
+    int ok = 0;
+    if (out) {
+        history = open_output(out, "radial_history.csv");
+        surface = open_output(out, "radial_surface.csv");
+        pred = open_output(out, "radial_predictions.csv");
+        checkpoint = open_output(out, "radial.nn");
+        if (!history || !surface || !pred || !checkpoint)
+            goto done;
+        fputs("step,train_loss,val_loss,train_accuracy,val_accuracy\n", history);
+        fputs("frame,epoch,x1,x2,p0,p1,p2\n", surface);
+        fputs("x1,x2,label,pred,p0,p1,p2\n", pred);
+    }
+    int step = 0;
+    for (;;) {
+        Metrics va = evaluate_radial(&current, val, VAL_N, NULL);
+        if (!isfinite(va.loss))
+            goto done;
+        if (va.loss < minimum) {
+            minimum = va.loss;
+            selected = current;
+            *best_step = step;
+        }
+        if (out) {
+            Metrics tr = evaluate_radial(&current, train, TRAIN_N, NULL);
+            fprintf(history, "%d,%.17g,%.17g,%.17g,%.17g\n", step, tr.loss, va.loss, tr.accuracy, va.accuracy);
+            if (!write_surface(surface, NULL, &current, step, step))
+                goto done;
+        }
+        int advanced = radial_step(&current, train, TRAIN_N);
+        if (advanced == 0)
+            break;
+        if (advanced < 0 || ++step > 100)
+            goto done;
+    }
+    if (out && (!radial_save(&selected, checkpoint) ||
+                !write_surface(surface, NULL, &selected, step + 1, *best_step)))
+        goto done;
+    *test_result = evaluate_radial(&selected, test, TEST_N, pred);
+    ok = isfinite(test_result->loss);
+done:
+    if (history && !close_output(history)) ok = 0;
+    if (surface && !close_output(surface)) ok = 0;
+    if (pred && !close_output(pred)) ok = 0;
+    if (checkpoint && !close_output(checkpoint)) ok = 0;
+    return ok;
+}
+
+static const char summary_columns[] =
+    "seed,width,epochs,best_epoch,train_n,val_n,test_n,test_loss,test_accuracy,"
+    "lr,batch_size,linear_test_loss,linear_test_accuracy,radial_step,radial_test_loss,radial_test_accuracy\n";
+
+/* A study row runs exactly the same training and validation, omitting plot and model files. */
+static int experiment(const char *out, FILE *summary, unsigned seed, int epochs, int width, double lr)
+{
+    if (!summary || epochs < 1 || epochs == INT_MAX || width < 1 ||
         !isfinite(lr) || lr <= 0.0)
         return 0;
 
@@ -290,7 +350,7 @@ int run_experiment(const char *out, unsigned seed, int epochs, int width, double
     generate_split(train, TRAIN_N, seed ^ UINT32_C(0xa34691c5));
     generate_split(val, VAL_N, seed ^ UINT32_C(0x62841f37));
     generate_split(test, TEST_N, seed ^ UINT32_C(0xd09b53e1));
-    if (!write_points(out, train, val, test))
+    if (out && !write_points(out, train, val, test))
         return 0;
 
     RNG init, shuffle;
@@ -301,46 +361,50 @@ int run_experiment(const char *out, unsigned seed, int epochs, int width, double
         order[i] = i;
 
     NN model = {0}, selected = {0};
-    char *checkpoint = output_path(out, "model.nn");
-    FILE *history = open_output(out, "history.csv");
-    FILE *surface = open_output(out, "surface.csv");
+    char *checkpoint = out ? output_path(out, "model.nn") : NULL;
+    FILE *history = out ? open_output(out, "history.csv") : NULL;
+    FILE *surface = out ? open_output(out, "surface.csv") : NULL;
     FILE *predictions = NULL;
     int ok = 0, best_epoch = 0, frame = 0;
     double best_loss = HUGE_VAL;
     Metrics test_metrics = {0}, linear_metrics = {0};
     LinearModel linear = {0};
-    if (!checkpoint || !history || !surface || !nn_init(&model, width, &init))
+    if ((out && (!checkpoint || !history || !surface)) || !nn_init(&model, width, &init) ||
+        !nn_init(&selected, width, &init))
         goto cleanup;
-    fputs("epoch,train_loss,val_loss,train_accuracy,val_accuracy\n", history);
-    fputs("frame,epoch,x1,x2,p0,p1,p2\n", surface);
+    if (out) {
+        fputs("epoch,train_loss,val_loss,train_accuracy,val_accuracy\n", history);
+        fputs("frame,epoch,x1,x2,p0,p1,p2\n", surface);
+    }
 
     for (int epoch = 0; epoch <= epochs; ++epoch) {
         Metrics tr, va;
         if (epoch > 0 && !train_epoch(&model, train, order, &shuffle, lr))
             goto cleanup;
-        if (!evaluate(&model, train, TRAIN_N, &tr, NULL) ||
+        if ((out && !evaluate(&model, train, TRAIN_N, &tr, NULL)) ||
             !evaluate(&model, val, VAL_N, &va, NULL))
             goto cleanup;
-        if (fprintf(history, "%d,%.17g,%.17g,%.17g,%.17g\n", epoch, tr.loss, va.loss,
+        if (out && fprintf(history, "%d,%.17g,%.17g,%.17g,%.17g\n", epoch, tr.loss, va.loss,
                     tr.accuracy, va.accuracy) < 0)
             goto cleanup;
         if (va.loss < best_loss) {
-            if (!nn_save(&model, checkpoint))
-                goto cleanup;
+            memcpy(selected.parameters, model.parameters, model.parameter_count * sizeof(double));
             best_loss = va.loss;
             best_epoch = epoch;
         }
-        if (is_snapshot_epoch(epoch, epochs) && !write_surface(surface, &model, frame++, epoch))
+        if (out && is_snapshot_epoch(epoch, epochs) && !write_surface(surface, &model, NULL, frame++, epoch))
             goto cleanup;
     }
 
-    if (!nn_load(&selected, checkpoint) || !write_surface(surface, &selected, frame, best_epoch) ||
-        !fit_linear(&linear, train))
+    if (!fit_linear(&linear, train))
         goto cleanup;
-    predictions = open_output(out, "predictions.csv");
-    if (!predictions)
-        goto cleanup;
-    fputs("x1,x2,label,pred,p0,p1,p2\n", predictions);
+    if (out) {
+        predictions = open_output(out, "predictions.csv");
+        if (!predictions || !nn_save(&selected, checkpoint) ||
+            !write_surface(surface, &selected, NULL, frame, best_epoch))
+            goto cleanup;
+        fputs("x1,x2,label,pred,p0,p1,p2\n", predictions);
+    }
     linear_metrics = evaluate_linear(&linear, test);
     ok = isfinite(linear_metrics.loss) && evaluate(&selected, test, TEST_N, &test_metrics, predictions);
 
@@ -358,12 +422,37 @@ cleanup:
         fputs("Experiment fehlgeschlagen (Rechnung, Modellspeicher oder Dateiausgabe).\n", stderr);
         return 0;
     }
-    if (!write_summary(out, seed, width, epochs, best_epoch, lr, test_metrics, linear_metrics))
+    Metrics radial = {0};
+    int best_step = 0;
+    if (!run_radial(out, train, val, test, &best_step, &radial))
         return 0;
-    printf("Ausgewaehlte Epoche %d/%d | Validierungsverlust %.5f | Testverlust %.5f | "
-           "Testgenauigkeit %.2f %% (%d Beispiele)\n", best_epoch, epochs, best_loss,
-           test_metrics.loss, 100 * test_metrics.accuracy, TEST_N);
-    printf("Lineares Vergleichsmodell | Testverlust %.5f | Testgenauigkeit %.2f %%\n",
-           linear_metrics.loss, 100 * linear_metrics.accuracy);
+    if (fprintf(summary, "%u,%d,%d,%d,%d,%d,%d,%.17g,%.17g,%.17g,%d,%.17g,%.17g,%d,%.17g,%.17g\n",
+                seed, width, epochs, best_epoch, TRAIN_N, VAL_N, TEST_N, test_metrics.loss, test_metrics.accuracy,
+                lr, BATCH, linear_metrics.loss, linear_metrics.accuracy, best_step, radial.loss, radial.accuracy) < 0)
+        return 0;
+    printf("Seed %u | Test-Kreuzentropie / Trefferquote: MLP %.5f / %.2f %%, "
+           "Radialnetz %.5f / %.2f %%, linear %.5f / %.2f %%\n", seed, test_metrics.loss,
+           100 * test_metrics.accuracy, radial.loss, 100 * radial.accuracy, linear_metrics.loss,
+           100 * linear_metrics.accuracy);
     return 1;
+}
+
+int run_experiment(const char *out, unsigned seed, int epochs, int width, double lr)
+{
+    FILE *fp = open_output(out, "summary.csv");
+    if (!fp)
+        return 0;
+    int ok = fputs(summary_columns, fp) >= 0 && experiment(out, fp, seed, epochs, width, lr);
+    return close_output(fp) && ok;
+}
+
+int run_study(const char *out, unsigned first_seed, int epochs, int width, double lr)
+{
+    FILE *fp = open_output(out, "vergleich.csv");
+    if (!fp)
+        return 0;
+    int ok = fputs(summary_columns, fp) >= 0;
+    for (unsigned k = 0; k < 5 && ok; ++k)
+        ok = experiment(NULL, fp, first_seed + k, epochs, width, lr);
+    return close_output(fp) && ok;
 }

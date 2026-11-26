@@ -3,3 +3,4 @@
 *.png binary
 *.gif binary
 *.nn binary
+results/radial.nn !binary text eol=lf diff

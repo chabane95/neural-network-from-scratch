@@ -1,4 +1,4 @@
-"""Render the surfaces, metrics and held-out predictions exported by the C program."""
+"""Figures from the C classifiers' grid predictions and experimental records."""
 
 import argparse
 import csv
@@ -11,55 +11,38 @@ import numpy as np
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 
-PAPER = "#FAF9F5"
-INK = "#182E30"
-MUTED = "#455F62"
-RULE = "#BCCBCD"
-GRID = "#DFE5E3"
-CLASSES = ("#146E7A", "#BB5939", "#674C91")
-FIELDS = ("#9AD2D1", "#F2C5AB", "#CCBEE3")
-TRAIN, VAL = "#1C7181", "#A64C2D"
-# Perceptually ordered dark-to-light ramp for normalized entropy.
-ENTROPY = ("#18364C", "#286479", "#4A918D", "#97B790", "#E7D78E", "#FFF2BB")
+NIGHT, LIGHT, PALE, HAIR = "#101923", "#F0F4F6", "#B9CCD3", "#364756"
+PAPER, TEXT, SOFT, RULE = "#F5F6F1", "#172833", "#465A66", "#CAD3CF"
+COLORS = ("#56C5F1", "#FFA15E", "#CEA1F7")
+MLP, RADIAL = "#AD4E2F", "#007270"
+TRAIN, VALID = "#496879", "#8A3D85"
 
 
 @lru_cache(maxsize=None)
-def font(size, role="body"):
-    faces = {
-        "body": ("segoeui.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"),
-        "bold": ("segoeuib.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"),
-        "title": ("georgia.ttf", "DejaVuSerif.ttf", "LiberationSerif-Regular.ttf"),
+def face(size, style):
+    options = {
+        "text": ("segoeui.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"),
+        "heavy": ("segoeuib.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"),
+        "mono": ("consola.ttf", "DejaVuSansMono.ttf", "LiberationMono-Regular.ttf"),
     }
-    for face in faces[role]:
+    for name in options[style]:
         try:
-            return ImageFont.truetype(face, size)
+            return ImageFont.truetype(name, size)
         except OSError:
             pass
     return ImageFont.load_default(size=size)
 
 
-def label(draw, xy, value, size=20, color=INK, role="body", anchor="lt"):
-    draw.text(xy, str(value), font=font(size, role), fill=color, anchor=anchor)
+def text(draw, x, y, value, size, color, style="text", anchor="lt"):
+    draw.text((x, y), str(value), font=face(size, style), fill=color, anchor=anchor)
 
 
-def decimal(value, digits=1):
+def number(value, digits=2):
     return f"{value:.{digits}f}".replace(".", ",").replace("-", "−")
 
 
-def percent(value):
-    return decimal(100 * value) + " %"
-
-
-def rgb(colors):
-    return np.array([ImageColor.getrgb(c) for c in colors])
-
-
-def ramp(values, colors):
-    stops = rgb(colors)
-    scaled = np.clip(values, 0, 1) * (len(stops) - 1)
-    lo = np.minimum(scaled.astype(int), len(stops) - 2)
-    diff = (scaled - lo)[..., None]
-    return np.uint8(np.rint(stops[lo] * (1 - diff) + stops[lo + 1] * diff))
+def fraction(value):
+    return number(100 * float(value), 1) + " %"
 
 
 def read_rows(path):
@@ -105,264 +88,284 @@ def read_surfaces(path):
     return surfaces
 
 
-def header(draw, title, subtitle, width):
-    label(draw, (62, 38), title, 55, role="title")
-    label(draw, (65, 111), subtitle, 22, MUTED)
-    draw.line((64, 159, width - 64, 159), fill=RULE, width=2)
+
+def page(title, subtitle, size, dark=False):
+    paper, ink, soft, rule = (NIGHT, LIGHT, PALE, HAIR) if dark else (PAPER, TEXT, SOFT, RULE)
+    im = Image.new("RGB", size, paper)
+    d = ImageDraw.Draw(im)
+    text(d, 64, 40, title, 52, ink, "heavy")
+    text(d, 67, 118, subtitle, 22, soft)
+    d.line((66, 168, size[0] - 66, 168), fill=rule, width=2)
+    return im
 
 
-def symbol(draw, xy, group, radius):
-    x, y = xy
-    r = radius
-    if group == 0:
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=CLASSES[0], outline=PAPER, width=1)
-    elif group == 1:
-        draw.polygon([(x, y - r - 1), (x - r - 1, y + r), (x + r + 1, y + r)],
-                     fill=CLASSES[1], outline=PAPER, width=1)
+def mark(draw, x, y, k, r, fill, outline):
+    if k == 0:
+        draw.ellipse((x-r, y-r, x+r, y+r), fill=fill, outline=outline)
+    elif k == 1:
+        draw.polygon(((x, y-r-1), (x-r-1, y+r), (x+r+1, y+r)), fill=fill, outline=outline)
     else:
-        draw.rectangle((x - r, y - r, x + r, y + r), fill=CLASSES[2], outline=PAPER, width=1)
+        draw.rectangle((x-r, y-r, x+r, y+r), fill=fill, outline=outline)
 
 
-def coordinate_ticks(low, high):
-    step = nice_step((high - low) / 4.8)
-    return np.arange(math.ceil(low / step - 1e-9), math.floor(high / step + 1e-9) + 1) * step
-
-
-def nice_step(rough):
-    magnitude = 10 ** math.floor(math.log10(rough))
-    for multiple in (1, 2, 2.5, 5, 10):
-        if multiple * magnitude >= rough - 1e-12:
-            return multiple * magnitude
-
-
-def compact_number(value):
-    return f"{value:.4g}".replace(".", ",").replace("-", "−") if abs(value) > 1e-12 else "0"
-
-
-def map_panel(image, surface, probabilities, box, points=(), entropy=False, small=False):
-    left, top, size = box
-    draw = ImageDraw.Draw(image)
-    # Colors are assigned after interpolation; no artificial model evaluations.
-    if entropy:
-        safe = np.maximum(probabilities, 1e-300)
-        values = -np.sum(probabilities * np.log(safe), axis=2) / math.log(3)
-        pixels = ramp(values, ENTROPY)
-    else:
-        pixels = np.uint8(rgb(FIELDS)[np.argmax(probabilities, axis=2)])
-    tile = Image.fromarray(pixels)
-    marks = ImageDraw.Draw(tile)
-    x0, x1 = surface.xs[[0, -1]]
-    y0, y1 = surface.ys[[0, -1]]
-    sx = lambda x: round((x - x0) * (size - 1) / (x1 - x0))
-    sy = lambda y: round((y1 - y) * (size - 1) / (y1 - y0))
-    for x, y, actual in points:
-        px, py = sx(x), sy(y)
-        if entropy:
-            for color, w in ((PAPER, 5), (INK, 2)):
-                marks.line((px - 5, py - 5, px + 5, py + 5), fill=color, width=w)
-                marks.line((px + 5, py - 5, px - 5, py + 5), fill=color, width=w)
-        else:
-            symbol(marks, (px, py), actual, 3 if small else 5)
-    image.paste(tile, (left, top))
-    right, last = left + size - 1, top + size - 1
-    draw.rectangle((left, top, right, last), outline="#788D91")
+def map_tile(im, xy, s, surf, points, small=False):
+    """The brightest area in a class has low entropy. Tied logits stay neutral."""
+    p = surf.upsample(s)
+    entropy = -np.sum(p * np.log(np.maximum(p, 1e-300)), axis=-1) / math.log(3)
+    certainty = np.clip(1.0 - entropy, 0, 1)[..., None]
+    palette = np.array([ImageColor.getrgb(c) for c in COLORS], dtype=float)
+    base = np.array([25, 38, 51], dtype=float)
+    # A probability-weighted hue avoids a false class at a three-way tie.
+    hue = p @ palette
+    pixels = base + 0.49 * certainty ** 0.7 * (hue - base)
+    tile = Image.fromarray(pixels.astype("uint8"))
+    d = ImageDraw.Draw(tile, "RGBA")
+    x0, x1 = surf.xs[[0, -1]]
+    y0, y1 = surf.ys[[0, -1]]
+    tx = lambda x: round((x - x0) / (x1 - x0) * (s - 1))
+    ty = lambda y: round((y1 - y) / (y1 - y0) * (s - 1))
+    ticks = [t for t in (-1, -0.5, 0, 0.5, 1) if x0 <= t <= x1 and y0 <= t <= y1]
+    for t in ticks:
+        alpha = 76 if t == 0 else 29
+        d.line((tx(t), 0, tx(t), s-1), fill=(217, 229, 232, alpha))
+        d.line((0, ty(t), s-1, ty(t)), fill=(217, 229, 232, alpha))
+    # Draw error halos last, so nearby data cannot cover them.
+    wrong = []
+    for px, py, actual, pred in points:
+        x, y = tx(px), ty(py)
+        mark(d, x, y, actual, 3 if small else 4, COLORS[actual], NIGHT)
+        if pred is not None and pred != actual:
+            wrong.append((x, y))
+    for x, y in wrong:
+        r = 6 if small else 8
+        d.ellipse((x-r, y-r, x+r, y+r), outline=LIGHT, width=1 if small else 2)
+    im.paste(tile, xy)
+    d = ImageDraw.Draw(im)
+    left, top = xy
+    d.rectangle((left, top, left+s-1, top+s-1), outline="#71818E")
     fs = 15 if small else 18
-    for tick in coordinate_ticks(x0, x1):
-        xx = left + sx(tick)
-        draw.line((xx, last, xx, last + 6), fill=MUTED)
-        label(draw, (xx, last + 11), compact_number(tick), fs, MUTED, anchor="mt")
-    for tick in coordinate_ticks(y0, y1):
-        yy = top + sy(tick)
-        draw.line((left - 6, yy, left, yy), fill=MUTED)
-        label(draw, (left - 11, yy), compact_number(tick), fs, MUTED, anchor="rm")
-    label(draw, (right + 9, last + 4), "x₁", fs + 2, role="bold")
-    label(draw, (left - 11, top - 10), "x₂", fs + 2, role="bold", anchor="rb")
-
-
-def legend(draw, xy, spacing=130, size=19):
-    x, y = xy
-    for k in range(3):
-        symbol(draw, (x + k * spacing + 7, y), k, 7)
-        label(draw, (x + k * spacing + 22, y), f"Klasse {k}", size, anchor="lm")
-
-
-def coordinates(rows):
-    return [(float(r["x1"]), float(r["x2"]), int(r["label"])) for r in rows]
-
-
-def decision_figure(path, surface, predictions, summary):
-    image = Image.new("RGB", (1480, 1010), PAPER)
-    d = ImageDraw.Draw(image)
-    header(d, "Wie das Netz die Spiralen trennt",
-           f"Drei-Klassen-Klassifikation   ·   Ausgewähltes Modell aus Epoche {surface.epoch}   ·   "
-           f"{summary['test_n']} unabhängige Testpunkte", image.width)
-    label(d, (110, 194), "Entscheidungsgebiete", 31, role="bold")
-    label(d, (803, 194), "Unsicherheit des Modells", 31, role="bold")
-    label(d, (110, 244), "Flächen zeigen die jeweils wahrscheinlichste Klasse.", 20, MUTED)
-    label(d, (803, 244), "Normierte Entropie der drei Klassenwahrscheinlichkeiten.", 20, MUTED)
-    size = 556
-    p = surface.upsample(size)
-    errors = [r for r in predictions if r["pred"] != r["label"]]
-    map_panel(image, surface, p, (112, 301, size), coordinates(predictions))
-    map_panel(image, surface, p, (805, 301, size), coordinates(errors), entropy=True)
-    legend(d, (112, 918), spacing=164)
-    label(d, (112, 952), "Symbolform und -farbe geben die wahre Klasse an.", 19, MUTED)
-    grad = np.broadcast_to(np.linspace(0, 1, size), (13, size))
-    image.paste(Image.fromarray(ramp(grad, ENTROPY)), (805, 905))
-    label(d, (805, 925), "0  ·  eindeutig", 17, MUTED)
-    label(d, (1361, 925), "1  ·  gleichverteilt", 17, MUTED, anchor="rt")
-    label(d, (805, 957), f"×  Fehlklassifizierte Testpunkte ({len(errors)})", 19)
-    image.save(path)
-
-
-def series_key(draw, x, y, size=18):
-    for off, color, name in ((0, TRAIN, "Training"), (138, VAL, "Validierung")):
-        draw.line((x + off, y, x + off + 28, y), fill=color, width=4)
-        label(draw, (x + off + 35, y), name, size, anchor="lm")
-
-
-def plot_metrics(draw, box, epochs, train, val, best, accuracy=False, small=False, until=None):
-    left, top, width, height = box
-    right, bottom = left + width, top + height
-    xmax = max(1, int(epochs[-1]))
-    step = 25 if accuracy else nice_step(max(max(train), max(val), 1e-6) / (2.8 if small else 3.5))
-    ymax = 100 if accuracy else step * math.ceil(max(max(train), max(val), 1e-6) / step)
-    fs = 13 if small else 17
-    xx = lambda e: left + width * e / xmax
-    yy = lambda v: bottom - height * v / ymax
-    for tick in np.arange(0, ymax + step / 2, step):
-        draw.line((left, yy(tick), right, yy(tick)), fill=GRID)
-        label(draw, (left - 9, yy(tick)), compact_number(tick), fs, MUTED, anchor="rm")
-    xstep = max(1, math.ceil(nice_step(xmax / (3.6 if small else 6))))
-    ticks = list(np.arange(0, xmax + 0.001, xstep))
-    if xmax - ticks[-1] > 0.56 * xstep:
-        ticks.append(xmax)
     for tick in ticks:
-        draw.line((xx(tick), bottom, xx(tick), bottom + 4), fill=MUTED)
-        label(draw, (xx(tick), bottom + 8), str(int(tick)), fs, MUTED, anchor="mt")
-    if best is not None:
-        for y in range(top, bottom, 10):
-            draw.line((xx(best), y, xx(best), min(y + 5, bottom)), fill=MUTED, width=2)
-    for series, color in ((train, TRAIN), (val, VAL)):
-        factor = 100 if accuracy else 1
-        pts = [(xx(e), yy(v * factor)) for e, v in zip(epochs, series) if until is None or e <= until]
-        if len(pts) > 1:
-            draw.line(pts, fill=color, width=2 if small else 3, joint="curve")
-        if pts:
-            x, y = pts[-1]
-            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=color)
+        tickname = f"{tick:g}".replace(".", ",").replace("-", "−")
+        text(d, left+tx(tick), top+s+7, tickname, fs, PALE, "mono", "mt")
+        text(d, left-8, top+ty(tick), tickname, fs, PALE, "mono", "rm")
+    text(d, left+s+8, top+s-6, "x₁", fs+1, PALE, anchor="lm")
+    text(d, left-9, top-8, "x₂", fs+1, PALE, anchor="rb")
 
 
-def training_figure(path, history, predictions, summary):
-    image = Image.new("RGB", (1480, 950), PAPER)
-    d = ImageDraw.Draw(image)
-    best = int(summary["best_epoch"])
-    header(d, "Lernkurven und unabhängiger Test",
-           f"{summary['train_n']} Trainingspunkte   ·   {summary['val_n']} Validierungspunkte   ·   "
-           f"{summary['test_n']} Testpunkte   ·   Seed {summary['seed']}", image.width)
-    label(d, (65, 192), "Verlauf des Trainings", 31, role="bold")
-    label(d, (850, 192), "Konfusionsmatrix", 31, role="bold")
-    series_key(d, 68, 265)
-    d.line((360, 265, 371, 265), fill=MUTED, width=2)
-    d.line((376, 265, 387, 265), fill=MUTED, width=2)
-    label(d, (397, 265), f"Auswahl · Epoche {best}", 18, anchor="lm")
-    e = history["epoch"]
-    label(d, (68, 315), "Kreuzentropie", 21, role="bold")
-    plot_metrics(d, (123, 372, 617, 152), e, history["train_loss"], history["val_loss"], best)
-    label(d, (68, 595), "Trefferquote (%)", 21, role="bold")
-    plot_metrics(d, (123, 649, 617, 149), e, history["train_accuracy"], history["val_accuracy"], best, True)
-    label(d, (432, 842), "Epoche", 19, MUTED, anchor="mt")
-
-    matrix = np.zeros((3, 3), dtype=int)
-    for row in predictions:
-        matrix[int(row["label"]), int(row["pred"])] += 1
-    label(d, (850, 252), "Anzahl der Testpunkte je Klassenpaar", 20, MUTED)
-    left, top, cell = 982, 381, 100
-    label(d, (left + 1.5 * cell, 306), "Vorhergesagte Klasse", 20, role="bold", anchor="mt")
-    label(d, (850, 358), "Wahre Klasse", 18, MUTED)
-    for i in range(3):
-        label(d, (left + (i + 0.5) * cell, top - 13), str(i), 20, MUTED, anchor="mb")
-        label(d, (left - 18, top + (i + 0.5) * cell), str(i), 20, MUTED, anchor="rm")
-        for j in range(3):
-            fraction = matrix[i, j] / max(matrix.max(), 1)
-            color = tuple(ramp(np.array(fraction), ("#E9EEEC", "#146474")).tolist())
-            x, y = left + j * cell, top + i * cell
-            d.rectangle((x, y, x + cell - 3, y + cell - 3), fill=color)
-            label(d, (x + cell / 2, y + cell / 2), str(matrix[i, j]), 32,
-                  PAPER if fraction > 0.58 else INK, "bold", "mm")
-    d.line((850, 724, 1410, 724), fill=RULE, width=2)
-    label(d, (850, 760), percent(float(summary["test_accuracy"])), 45, TRAIN, "title")
-    label(d, (1135, 760), decimal(float(summary["test_loss"]), 3), 45, TRAIN, "title")
-    label(d, (850, 823), "Test-Trefferquote", 19, MUTED)
-    label(d, (1135, 823), "Test-Kreuzentropie", 19, MUTED)
-    label(d, (65, 902), "Modellwahl nach kleinster Validierungs-Kreuzentropie.", 19, MUTED)
-    if "linear_test_accuracy" in summary:
-        baseline = percent(float(summary["linear_test_accuracy"]))
-        label(d, (850, 902), f"Lineare Softmax-Referenz im Test · {baseline}", 19, MUTED)
-    image.save(path)
+def legend(d, x, y, compact=False):
+    spacing = 100 if compact else 142
+    for k in range(3):
+        mark(d, x+k*spacing, y, k, 6, COLORS[k], NIGHT)
+        text(d, x+13+k*spacing, y, f"Klasse {k}", 16 if compact else 20, LIGHT, anchor="lm")
 
 
-def animate(path, surfaces, history, train_points, predictions, summary):
+def samples(records):
+    return [(float(r["x1"]), float(r["x2"]), int(r["label"]), int(r["pred"]) if "pred" in r else None)
+            for r in records]
+
+
+def decisions(path, nets, summary):
+    paired = len(nets) == 2
+    im = page("Was die Drehsymmetrie verändert" if paired else "Die Entscheidungsfläche des MLP",
+              f"Entscheidungsflächen auf denselben {summary['test_n']} Testpunkten  /  Seed {summary['seed']}",
+              (1500 if paired else 820, 990), dark=True)
+    d = ImageDraw.Draw(im)
+    for i, (name, surfaces, _, predictions) in enumerate(nets):
+        left = (115, 838)[i]
+        acc = fraction(summary[("test_accuracy", "radial_test_accuracy")[i]])
+        loss = number(float(summary[("test_loss", "radial_test_loss")[i]]), 4)
+        text(d, left, 203, name, 33, LIGHT, "heavy")
+        text(d, left, 255, f"{acc} richtig    /    Kreuzentropie {loss}", 20, PALE, "mono")
+        map_tile(im, (left, 317), 548, surfaces[-1], predictions)
+    legend(d, 115, 940)
+    d.ellipse((581, 932, 597, 948), outline=LIGHT, width=2)
+    text(d, 608, 940, "Testfehler", 20, LIGHT, anchor="lm")
+    if paired:
+        text(d, 838, 940, "Dunkle Übergänge zeigen hohe Vorhersageentropie", 19, PALE, anchor="lm")
+    im.save(path)
+
+
+def curve(d, xs, ys, color, dashed=False, width=4):
+    remaining, painting = 10.0, True
+    for x0, y0, x1, y1 in zip(xs, ys, xs[1:], ys[1:]):
+        if not dashed:
+            d.line((x0, y0, x1, y1), fill=color, width=width)
+            continue
+        dx, dy = x1-x0, y1-y0
+        length = math.hypot(dx, dy)
+        pos = 0.0
+        while pos < length:
+            step = min(length-pos, remaining)
+            if painting:
+                a, b = pos/length, (pos+step)/length
+                d.line((x0+a*dx, y0+a*dy, x0+b*dx, y0+b*dy), fill=color, width=width)
+            pos += step
+            remaining -= step
+            if remaining < 1e-8:
+                painting = not painting
+                remaining = 10.0 if painting else 7.0
+
+
+def loss_plot(d, left, records, best, xlabel, low, high):
+    key = "step" if "step" in records[0] else "epoch"
+    steps = np.array([int(r[key]) for r in records])
+    tr = np.array([float(r["train_loss"]) for r in records])
+    va = np.array([float(r["val_loss"]) for r in records])
+    x0, x1, y0, y1 = left+30, left+541, 343, 635
+    xmax = max(steps[-1], 1)
+    sx = lambda x: x0 + (x1-x0) * x / xmax
+    sy = lambda y: y1 - (y1-y0) * (np.log10(y)-math.log10(low)) / (math.log10(high)-math.log10(low))
+    for exp in range(math.floor(math.log10(low)), math.ceil(math.log10(high))+1):
+        for mantissa in (1, 2, 5):
+            tick = mantissa * 10.0 ** exp
+            if low <= tick <= high:
+                yy = sy(tick)
+                d.line((x0, yy, x1, yy), fill=RULE)
+                text(d, x0-9, yy, f"{tick:g}".replace(".", ","), 19, SOFT, "mono", "rm")
+    for tick in sorted({round(v) for v in np.linspace(0, xmax, min(5, xmax+1))}):
+        text(d, sx(tick), y1+13, tick, 18, SOFT, "mono", "mt")
+    curve(d, sx(steps), sy(tr), TRAIN, width=3)
+    curve(d, sx(steps), sy(va), VALID, dashed=True, width=4)
+    xx, yy = sx(best), sy(va[steps == best][0])
+    d.ellipse((xx-6, yy-6, xx+6, yy+6), fill=PAPER, outline=VALID, width=3)
+    text(d, (x0+x1)/2, y1+57, xlabel, 20, TEXT, anchor="mt")
+
+
+def training(path, nets, summary):
+    paired = len(nets) == 2
+    im = page("Wann sich weiteres Training lohnt" if paired else "Der Trainingsverlauf des MLP",
+              "Kreuzentropie auf Training und Validierung  /  logarithmische Skala",
+              (1500 if paired else 840, 856))
+    d = ImageDraw.Draw(im)
+    lo = min(float(row[key]) for _, _, h, _ in nets for row in h for key in ("train_loss", "val_loss"))
+    hi = max(float(row[key]) for _, _, h, _ in nets for row in h for key in ("train_loss", "val_loss"))
+    low = min(0.02, lo * 0.85)
+    high = max(1.5, hi * 1.1)
+    for i, (name, _, h, _) in enumerate(nets):
+        x = (110, 838)[i]
+        step = int(summary[("best_epoch", "radial_step")[i]])
+        text(d, x, 208, name, 32, TEXT, "heavy")
+        text(d, x, 261, f"Ausgewählt in {('Epoche', 'Newton-Schritt')[i]} {step}", 21, SOFT)
+        loss_plot(d, x, h, step, ("Epoche", "Newton-Schritt")[i], low, high)
+    d.line((65, 746, im.width-65, 746), fill=RULE, width=2)
+    d.line((100, 796, 145, 796), fill=TRAIN, width=3)
+    text(d, 157, 796, f"Training · {summary['train_n']} Punkte", 21, TEXT, anchor="lm")
+    curve(d, [518, 572], [796, 796], VALID, dashed=True)
+    text(d, 583, 796, f"Validierung · {summary['val_n']} Punkte", 21, TEXT, anchor="lm")
+    if paired:
+        d.ellipse((1027, 787, 1045, 805), fill=PAPER, outline=VALID, width=3)
+        text(d, 1060, 796, "Geringster Validierungsverlust", 21, TEXT, anchor="lm")
+    im.save(path)
+
+
+def study_chart(path, rows):
+    im = page("Der Vergleich über fünf Stichproben",
+              "Jede Zeile zeigt beide Modelle auf identischen Testpunkten. Die horizontale Lage gibt den Messwert an.",
+              (1500, 805))
+    d = ImageDraw.Draw(im)
+    metrics = [("Test-Kreuzentropie", "test_loss", 1.0), ("Test-Trefferquote (%)", "test_accuracy", 100.0)]
+    text(d, 66, 284, "Seed", 20, SOFT, "mono")
+    for col, (name, key, scale) in enumerate(metrics):
+        left, right = [(199, 707), (857, 1364)][col]
+        text(d, left, 210, name, 29, TEXT, "heavy")
+        values = [[scale*float(r[k]) for k in (key, "radial_"+key)] for r in rows]
+        if col == 0:
+            largest = max(v for pair in values for v in pair)
+            magnitude = 10 ** math.floor(math.log10(max(largest / 5, 1e-6)))
+            unit = next(s * magnitude for s in (1, 2, 5, 10) if s*magnitude >= largest/5)
+            low, high = 0, max(unit, math.ceil(largest / unit) * unit)
+            ticks = np.arange(0, high + unit/2, unit)
+        else:
+            low, high = math.floor(min(v for pair in values for v in pair))-1, 100
+            ticks = np.linspace(low, high, 5)
+        sx = lambda value: left+(right-left)*(value-low)/(high-low)
+        for tick in ticks:
+            xx = sx(tick)
+            d.line((xx, 316, xx, 650), fill=RULE)
+            text(d, xx, 273, number(tick, 2 if col == 0 else 1), 18, SOFT, "mono", "mt")
+        for i, (row, (baseline, radial)) in enumerate(zip(rows, values)):
+            y = 351+i*65
+            if col == 0:
+                text(d, 72, y, row["seed"], 25, TEXT, "mono", "lm")
+            xx, rx = sx(baseline), sx(radial)
+            d.line((xx,y,rx,y), fill="#81919A", width=3)
+            d.rectangle((xx-6,y-6,xx+6,y+6), fill=MLP)
+            d.ellipse((rx-7,y-7,rx+7,y+7), fill=RADIAL, outline=PAPER)
+    d.line((65, 682, 1435, 682), fill=RULE, width=2)
+    d.rectangle((83,735,99,751), fill=MLP)
+    text(d, 112, 743, "MLP", 23, TEXT, anchor="lm")
+    d.ellipse((262,735,278,751), fill=RADIAL)
+    text(d, 291, 743, "Radialnetz", 23, TEXT, anchor="lm")
+    text(d, 1431, 743, f"{rows[0]['test_n']} Testpunkte je Stichprobe", 20, SOFT, anchor="rm")
+    im.save(path)
+
+
+def animate(path, nets, train, summary):
     frames = []
-    best = int(summary["best_epoch"])
-    epochs = history["epoch"]
-    for i, surface in enumerate(surfaces):
-        selected = i == len(surfaces) - 1
-        e = surface.epoch
-        row = np.flatnonzero(epochs == e)
-        if not len(row):
-            raise ValueError(f"Trainingsmetriken für Epoche {e} fehlen.")
-        index = row[-1]
-        image = Image.new("RGB", (960, 626), PAPER)
-        d = ImageDraw.Draw(image)
-        label(d, (34, 20), "Wie eine Entscheidungsgrenze entsteht", 40, role="title")
-        d.line((36, 85, 924, 85), fill=RULE, width=2)
-        size = 403
-        map_panel(image, surface, surface.upsample(size), (86, 125, size),
-                  predictions if selected else train_points, small=True)
-        legend(d, (83, 589), spacing=125, size=16)
-        x = 561
-        label(d, (x, 123), "Ausgewähltes Modell" if selected else "Trainingsverlauf", 22, role="bold")
-        label(d, (x, 170), f"Epoche {e}", 39, TRAIN, "title")
-        phase = f"{len(predictions)} Testpunkte" if selected else f"{len(train_points)} Trainingspunkte"
-        label(d, (x, 229), f"Gezeigte Symbole · {phase}", 17, MUTED)
-        label(d, (x, 283), "Kreuzentropie", 18, role="bold")
-        plot_metrics(d, (601, 329, 295, 94), epochs, history["train_loss"], history["val_loss"],
-                     best if selected else None, small=True, until=e)
-        label(d, (890, 451), "Epoche", 14, MUTED, anchor="rt")
-        series_key(d, x, 483, size=15)
-        d.line((x, 516, 918, 516), fill=RULE)
-        value = float(summary["test_accuracy"]) if selected else history["val_accuracy"][index]
-        label(d, (x, 535), percent(value), 36, role="title")
-        label(d, (x, 585), "Test-Trefferquote" if selected else "Validierungs-Trefferquote", 17, MUTED)
-        frames.append(image.quantize(colors=128, dither=Image.Dither.NONE))
-    durations = [400] * len(frames)
-    durations[0], durations[-1] = 900, 2200
+    count = max(len(surfaces)-1 for _, surfaces, _, _ in nets)
+    paired = len(nets) == 2
+    for fi in range(count+1):
+        final = fi == count
+        im = Image.new("RGB", (1100 if paired else 620, 717), NIGHT)
+        d = ImageDraw.Draw(im)
+        text(d, 37, 27, "Zwei Wege zur Spiralgrenze" if paired else "Wie das MLP lernt", 42, LIGHT, "heavy")
+        msg = (f"Auswahl nach Validierungsverlust  /  {summary['test_n']} Testpunkte" if final
+               else f"Trainingsverlauf  /  {summary['train_n']} Trainingspunkte")
+        if paired and not final:
+            msg += "  /  getrennte Trainingsskalen"
+        text(d, 40, 90, msg, 20, PALE)
+        d.line((39, 132, im.width-40, 132), fill=HAIR, width=2)
+        for i, (name, surfaces, _, pred) in enumerate(nets):
+            idx = -1 if final else round(fi*(len(surfaces)-2)/max(count-1, 1))
+            surf = surfaces[idx]
+            left = (83, 634)[i]
+            text(d, left, 162, name, 27, LIGHT, "heavy")
+            text(d, left, 208, f"{('Epoche', 'Newton-Schritt')[i]} {surf.epoch}", 19, PALE, "mono")
+            map_tile(im, (left, 259), 384, surf, pred if final else train, small=True)
+        legend(d, 83, 693, compact=True)
+        if paired:
+            text(d, 634, 693, "Weiße Ringe markieren Testfehler." if final else "Farbe und Symbolform zeigen die Klasse.",
+                 17, PALE, anchor="lm")
+        frames.append(im.quantize(colors=160, dither=Image.Dither.NONE))
+    durations = [380] * len(frames)
+    durations[0], durations[-1] = 1100, 2600
     frames[0].save(path, save_all=True, append_images=frames[1:], duration=durations, loop=0, optimize=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualisierungen aus den CSV-Ausgaben des C-Trainings erzeugen.")
-    parser.add_argument("--run", type=Path, default=Path("results"), help="Verzeichnis des C-Laufs (results)")
-    parser.add_argument("--out", type=Path, default=Path("assets"), help="Ziel für PNG und GIF (assets)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Die C-Vorhersagen und Messreihen als Grafiken rendern.")
+    ap.add_argument("--run", type=Path, default=Path("results"))
+    ap.add_argument("--out", type=Path, default=Path("assets"))
+    ap.add_argument("--study", type=Path, help="CSV aus spiralnet study (Standard: vergleich.csv im Laufordner)")
+    args = ap.parse_args()
     try:
-        rows = read_rows(args.run / "history.csv")
-        history = {k: np.array([float(row[k]) for row in rows]) for k in rows[0]}
         summary = read_rows(args.run / "summary.csv")[0]
-        points = read_rows(args.run / "points.csv")
-        predictions = read_rows(args.run / "predictions.csv")
-        surfaces = read_surfaces(args.run / "surface.csv")
-        if surfaces[-1].epoch != int(summary["best_epoch"]):
-            raise ValueError("Die letzte Fläche gehört nicht zur ausgewählten Epoche.")
+        nets = []
+        models = [("MLP", "")]
+        if "radial_step" in summary:
+            models.append(("Radialnetz", "radial_"))
+        for name, prefix in models:
+            surfaces = read_surfaces(args.run / (prefix+"surface.csv"))
+            history = read_rows(args.run / (prefix+"history.csv"))
+            pred = samples(read_rows(args.run / (prefix+"predictions.csv")))
+            best = int(summary["best_epoch" if not prefix else "radial_step"])
+            if surfaces[-1].epoch != best:
+                raise ValueError(f"Ausgewählter Modellstand für {name} stimmt nicht mit summary.csv überein.")
+            nets.append((name, surfaces, history, pred))
+        train = samples(r for r in read_rows(args.run / "points.csv") if r["split"] == "train")
         args.out.mkdir(parents=True, exist_ok=True)
-        decision_figure(args.out / "entscheidungsgrenzen.png", surfaces[-1], predictions, summary)
-        training_figure(args.out / "training.png", history, predictions, summary)
-        animate(args.out / "lernprozess.gif", surfaces, history, coordinates(r for r in points if r["split"] == "train"),
-                coordinates(predictions), summary)
-    except (OSError, ValueError, IndexError, KeyError) as error:
-        parser.exit(1, f"Visualisierung fehlgeschlagen: {error}\n")
-    print(f"Drei Grafiken gespeichert in {args.out.resolve()}")
+        decisions(args.out / "entscheidungsgrenzen.png", nets, summary)
+        training(args.out / "training.png", nets, summary)
+        animate(args.out / "lernprozess.gif", nets, train, summary)
+        study = args.study or args.run / "vergleich.csv"
+        if args.study or study.exists():
+            rows = read_rows(study)
+            if len(rows) != 5:
+                raise ValueError("Der Stichprobenvergleich erwartet fünf Läufe.")
+            study_chart(args.out / "vergleich.png", rows)
+    except (OSError, KeyError, IndexError, ValueError) as exc:
+        ap.exit(1, f"Visualisierung fehlgeschlagen: {exc}\n")
+    print(f"Grafiken gespeichert in {args.out.resolve()}")
 
 
 if __name__ == "__main__":
